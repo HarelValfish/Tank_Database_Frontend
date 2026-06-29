@@ -12,15 +12,15 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
+  id-token: write   # required for OIDC → AWS
 
 env:
   AWS_REGION: us-east-1
   CLUSTER_NAME: tank-db
-  ECR_REPO: 769638986113.dkr.ecr.us-east-1.amazonaws.com/tank-db-frontend
+  ECR_REPO_NAME: tank-db-frontend
 
 jobs:
-  # ─── 1. BUILD ────────────────────────────────────────────────────
+  # ─── 1. BUILD (PR validation, no AWS needed) ─────────────────────
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -42,6 +42,8 @@ jobs:
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image-uri.outputs.value }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,16 +57,23 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set image URI output
+        id: image-uri
+        run: |
+          echo "value=${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO_NAME }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Build & push
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64
           push: true
+          provenance: false   # avoids OCI manifest list that can confuse ECR/kubectl
           tags: |
-            ${{ env.ECR_REPO }}:latest
-            ${{ env.ECR_REPO }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO_NAME }}:latest
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO_NAME }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -74,7 +83,6 @@ jobs:
     needs: push
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    environment: production
     steps:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -88,6 +96,6 @@ jobs:
       - name: Rolling update
         run: |
           kubectl set image deployment/frontend \
-            frontend=${{ env.ECR_REPO }}:${{ github.sha }} \
+            frontend=${{ needs.push.outputs.image }} \
             -n tank-db
           kubectl rollout status deployment/frontend -n tank-db --timeout=120s
